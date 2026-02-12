@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     "daphne",
     "django.contrib.auth",
     "django.contrib.contenttypes",
+    "django.contrib.staticfiles",
     "rest_framework",
     "channels",
     "voice_agent",
