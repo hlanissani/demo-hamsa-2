@@ -194,7 +194,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         log(f"[STT] TOTAL TIME: {total_time:.2f}s")
         return transcription
 
-    _SENTENCE_END_RE = re.compile(r'[.!?؟]$')
+    # More aggressive sentence detection for streaming TTS
+    # Matches sentence-ending punctuation OR Arabic comma/pause markers
+    _SENTENCE_END_RE = re.compile(r'[.!?؟،–\-:]\s*$')
 
     async def _call_webhook(self, text, sentence_q=None):
         """Call the webhook agent, stream tokens, push sentences to TTS queue."""
@@ -260,9 +262,13 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
                                 # Push sentence to TTS as soon as boundary detected
                                 stripped = sentence_buf.strip()
-                                if (sentence_q and len(stripped) >= 10
-                                        and self._SENTENCE_END_RE.search(stripped)):
-                                    log(f"[WEBHOOK] sentence ready: '{stripped[:80]}'")
+                                # More aggressive streaming: push on punctuation OR length threshold
+                                should_stream = (
+                                    len(stripped) >= 80 or  # Long enough, flush anyway
+                                    (len(stripped) >= 10 and self._SENTENCE_END_RE.search(stripped))  # Has punctuation
+                                )
+                                if sentence_q and should_stream:
+                                    log(f"[WEBHOOK] sentence ready ({len(stripped)} chars): '{stripped[:80]}'")
                                     await sentence_q.put(stripped)
                                     sentence_buf = ""
                                     sentences_pushed = True
@@ -308,9 +314,12 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
         # Fallback: if no sentences were streamed, split the final response
         if sentence_q and not sentences_pushed and full_response:
-            log("[WEBHOOK] no streaming sentences detected, falling back to split")
+            log("[WEBHOOK] ⚠️ NO STREAMING - Falling back to batch mode split")
+            log(f"[WEBHOOK] Sentence detection failed. Full response length: {len(full_response)}")
             for s in self._split_sentences(full_response):
                 await sentence_q.put(s)
+        elif sentences_pushed:
+            log("[WEBHOOK] ✓ STREAMING MODE - Sentences streamed to TTS in real-time")
 
         log(f"[WEBHOOK] final response: '{full_response[:200]}'")
         return full_response
