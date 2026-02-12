@@ -279,11 +279,12 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
                                 # Push sentence to TTS as soon as boundary detected
                                 stripped = sentence_buf.strip()
-                                # Aggressive streaming: start TTS earlier for faster response
+                                # Balanced streaming: fast response while ensuring audible audio
+                                # All thresholds >= 30 chars (minimum for Hamsa TTS to produce audio)
                                 should_stream = (
-                                    len(stripped) >= 45 or  # Reduced from 80: start TTS sooner
-                                    (len(stripped) >= 30 and self._COMMA_RE.search(stripped)) or  # Comma pause point
-                                    (len(stripped) >= 20 and self._SENTENCE_END_RE.search(stripped))  # Sentence ending
+                                    len(stripped) >= 50 or  # Long enough: flush for faster response
+                                    (len(stripped) >= 40 and self._COMMA_RE.search(stripped)) or  # Comma pause (40+ reduces tiny remainders)
+                                    (len(stripped) >= 30 and self._SENTENCE_END_RE.search(stripped))  # Sentence ending (min 30 for audio)
                                 )
                                 if sentence_q and should_stream:
                                     log(f"[WEBHOOK] sentence ready ({len(stripped)} chars): '{stripped[:80]}'")
