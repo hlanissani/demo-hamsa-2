@@ -1,11 +1,12 @@
 [phases.setup]
-nixPkgs = ['python310', 'pip']
+nixPkgs = ['python310']
 
 [phases.install]
-cmds = ['pip install --upgrade pip', 'pip install -r requirements.txt']
+cmds = ['pip install -r requirements.txt']
 
 [phases.build]
-cmds = ['python manage.py collectstatic --noinput']
+# Skip collectstatic during build - Railway will run it via build.sh if needed
+cmds = []
 
 [start]
 cmd = 'daphne -b 0.0.0.0 -p $PORT hamsa_ws.asgi:application'
