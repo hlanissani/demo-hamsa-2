@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hamsa Voice Agent</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 600px;
+            padding: 2rem;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 1.5rem;
+            margin-bottom: 2rem;
+            color: #38bdf8;
+        }
+
+        #chat-log {
+            background: #1e293b;
+            border-radius: 1rem;
+            padding: 1.5rem;
+            min-height: 300px;
+            max-height: 60vh;
+            overflow-y: auto;
+            margin-bottom: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .message {
+            padding: 0.75rem 1rem;
+            border-radius: 0.75rem;
+            max-width: 85%;
+            line-height: 1.6;
+            font-size: 1rem;
+            word-wrap: break-word;
+        }
+
+        .message.user {
+            background: #0ea5e9;
+            color: #fff;
+            align-self: flex-end;
+            border-bottom-left-radius: 0.75rem;
+            border-bottom-right-radius: 0.2rem;
+        }
+
+        .message.agent {
+            background: #334155;
+            color: #e2e8f0;
+            align-self: flex-start;
+            border-bottom-right-radius: 0.75rem;
+            border-bottom-left-radius: 0.2rem;
+        }
+
+        #status {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            min-height: 1.2rem;
+        }
+
+        .controls { display: flex; justify-content: center; }
+
+        #record-btn {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            border: 3px solid #38bdf8;
+            background: transparent;
+            color: #38bdf8;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        #record-btn:hover { background: rgba(56, 189, 248, 0.1); }
+
+        #record-btn.recording {
+            border-color: #ef4444;
+            background: rgba(239, 68, 68, 0.15);
+            animation: pulse 1.5s infinite;
+        }
+        #record-btn.recording svg { stroke: #ef4444; }
+
+        #record-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            50% { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
+        }
+
+        #chat-log::-webkit-scrollbar { width: 6px; }
+        #chat-log::-webkit-scrollbar-track { background: transparent; }
+        #chat-log::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hamsa Voice Agent</h1>
+        <div id="chat-log"></div>
+        <div id="status"></div>
+        <div class="controls">
+            <button id="record-btn" title="اضغط للتسجيل">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none"
+                     stroke="#38bdf8" stroke-width="2" stroke-linecap="round">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                    <line x1="12" y1="19" x2="12" y2="23"/>
+                    <line x1="8" y1="23" x2="16" y2="23"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <script>
+    (function () {
+        const chatLog   = document.getElementById('chat-log');
+        const statusEl  = document.getElementById('status');
+        const recordBtn = document.getElementById('record-btn');
+
+        let mediaRecorder = null;
+        let audioChunks   = [];
+        let isRecording   = false;
+        let ws            = null;
+        let agentBubble   = null;
+        let agentText     = '';
+
+        // Web Audio API for real-time TTS chunk playback
+        let playbackCtx   = null;
+        let nextPlayTime  = 0;
+        let ttsSampleRate = 16000;
+
+        // Response time tracking
+        let sttStartTime = null;
+        let webhookStartTime = null;
+        let ttsStartTime = null;
+        let sttResponseTime = 0;
+        let webhookResponseTime = 0;
+        let ttsResponseTime = 0;
+
+        // Session ID management - generate new session on every page load
+        const sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        console.log('[SESSION] Using session ID:', sessionId);
+
+        function connectWS() {
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${proto}://${location.host}/ws/agent/${sessionId}/`);
+
+            ws.onopen = () => {
+                console.log('[WS] connected');
+                setStatus('جاهز للتسجيل');
+            };
+
+            ws.onclose = () => {
+                console.log('[WS] disconnected, reconnecting...');
+                setStatus('جاري إعادة الاتصال...');
+                setTimeout(connectWS, 2000);
+            };
+
+            ws.onerror = (e) => console.error('[WS] error', e);
+
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+
+                switch (data.type) {
+                    case 'status':
+                        setStatus(data.message);
+                        break;
+
+                    case 'transcription':
+                        // STT response time
+                        if (sttStartTime) {
+                            sttResponseTime = Date.now() - sttStartTime;
+                            console.log(`%c[STT Response Time] ${sttResponseTime}ms`, 'color: #22c55e; font-weight: bold');
+                            sttStartTime = null;
+                        }
+
+                        addMessage(data.text, 'user');
+                        agentText = '';
+                        agentBubble = addMessage('', 'agent');
+
+                        // Start webhook timing
+                        webhookStartTime = Date.now();
+                        break;
+
+                    case 'token':
+                        agentText += data.content;
+                        if (agentBubble) agentBubble.textContent = agentText;
+                        scrollToBottom();
+                        break;
+
+                    case 'agent_response':
+                        // Webhook response time
+                        if (webhookStartTime) {
+                            webhookResponseTime = Date.now() - webhookStartTime;
+                            console.log(`%c[Webhook Response Time] ${webhookResponseTime}ms`, 'color: #3b82f6; font-weight: bold');
+                            webhookStartTime = null;
+                        }
+
+                        agentText = data.text;
+                        if (agentBubble) agentBubble.textContent = agentText;
+                        scrollToBottom();
+                        break;
+
+                    case 'tts_start':
+                        ttsSampleRate = data.sample_rate || 16000;
+                        initPlayback();
+
+                        // Start TTS timing
+                        ttsStartTime = Date.now();
+                        break;
+
+                    case 'tts_chunk':
+                        playPCMChunk(data.audio_base64);
+                        break;
+
+                    case 'done':
+                        // TTS response time (total time from start to finish)
+                        if (ttsStartTime) {
+                            ttsResponseTime = Date.now() - ttsStartTime;
+                            console.log(`%c[TTS Response Time] ${ttsResponseTime}ms`, 'color: #f59e0b; font-weight: bold');
+                            ttsStartTime = null;
+                        }
+
+                        // Summary of all response times
+                        const totalTime = sttResponseTime + webhookResponseTime + ttsResponseTime;
+                        console.log('%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'color: #8b5cf6');
+                        console.log('%c📊 Response Time Summary', 'color: #8b5cf6; font-weight: bold; font-size: 14px');
+                        console.log('%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'color: #8b5cf6');
+                        console.log(`%c🎤 STT:     ${sttResponseTime}ms`, 'color: #22c55e; font-size: 12px');
+                        console.log(`%c🔗 Webhook: ${webhookResponseTime}ms`, 'color: #3b82f6; font-size: 12px');
+                        console.log(`%c🔊 TTS:     ${ttsResponseTime}ms`, 'color: #f59e0b; font-size: 12px');
+                        console.log('%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'color: #8b5cf6');
+                        console.log(`%c⏱️  Total:   ${totalTime}ms`, 'color: #ec4899; font-weight: bold; font-size: 13px');
+                        console.log('%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', 'color: #8b5cf6');
+
+                        finishPlayback();
+                        break;
+
+                    case 'error':
+                        setStatus('خطأ: ' + data.message);
+                        enableRecording();
+                        break;
+                }
+            };
+        }
+
+        connectWS();
+
+        recordBtn.addEventListener('click', toggleRecording);
+
+        async function toggleRecording() {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                await startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                // Pre-init AudioContext during user gesture (required by autoplay policy)
+                if (!playbackCtx) {
+                    playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log('[AUDIO] created AudioContext, state:', playbackCtx.state);
+                }
+                if (playbackCtx.state === 'suspended') {
+                    await playbackCtx.resume();
+                    console.log('[AUDIO] resumed AudioContext');
+                }
+
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) audioChunks.push(e.data);
+                };
+
+                mediaRecorder.onstop = () => {
+                    stream.getTracks().forEach(t => t.stop());
+                    const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                    sendAudio(blob);
+                };
+
+                mediaRecorder.start();
+                isRecording = true;
+                recordBtn.classList.add('recording');
+                setStatus('جاري التسجيل...');
+            } catch (err) {
+                setStatus('لا يمكن الوصول إلى الميكروفون');
+                console.error(err);
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                mediaRecorder.stop();
+            }
+            isRecording = false;
+            recordBtn.classList.remove('recording');
+            disableRecording();
+        }
+
+        async function sendAudio(blob) {
+            setStatus('جاري تحويل الصوت...');
+            try {
+                const arrayBuffer = await blob.arrayBuffer();
+                const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                const wavBlob = audioBufferToWav(audioBuffer);
+                const reader = new FileReader();
+                reader.onloadend = () => {
+                    const base64 = reader.result.split(',')[1];
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        // Start STT timing
+                        sttStartTime = Date.now();
+                        ws.send(JSON.stringify({ audio_base64: base64 }));
+                    } else {
+                        setStatus('غير متصل بالخادم');
+                        enableRecording();
+                    }
+                };
+                reader.readAsDataURL(wavBlob);
+                audioCtx.close();
+            } catch (err) {
+                console.error('Audio conversion error:', err);
+                setStatus('خطأ في تحويل الصوت');
+                enableRecording();
+            }
+        }
+
+        function audioBufferToWav(buffer) {
+            const numChannels = 1;
+            const sampleRate = buffer.sampleRate;
+            const format = 1; // PCM
+            const bitDepth = 16;
+            const samples = buffer.getChannelData(0);
+            const dataLength = samples.length * (bitDepth / 8);
+            const headerLength = 44;
+            const totalLength = headerLength + dataLength;
+            const arrayBuffer = new ArrayBuffer(totalLength);
+            const view = new DataView(arrayBuffer);
+
+            // WAV header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, totalLength - 8, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, format, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true);
+            view.setUint16(32, numChannels * (bitDepth / 8), true);
+            view.setUint16(34, bitDepth, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, dataLength, true);
+
+            // PCM samples
+            let offset = 44;
+            for (let i = 0; i < samples.length; i++) {
+                const s = Math.max(-1, Math.min(1, samples[i]));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                offset += 2;
+            }
+
+            return new Blob([arrayBuffer], { type: 'audio/wav' });
+        }
+
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        function initPlayback() {
+            if (!playbackCtx) {
+                playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (playbackCtx.state === 'suspended') {
+                playbackCtx.resume();
+            }
+            nextPlayTime = playbackCtx.currentTime;
+            console.log('[AUDIO] playback initialized, state:', playbackCtx.state, 'sampleRate:', ttsSampleRate);
+        }
+
+        function playPCMChunk(base64) {
+            try {
+                if (!playbackCtx) initPlayback();
+
+                // Decode base64 → bytes
+                const binary = atob(base64);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+
+                console.log('[AUDIO] chunk received:', bytes.length, 'bytes, ctx state:', playbackCtx.state);
+
+                // Ensure even byte count for Int16
+                const usable = bytes.length - (bytes.length % 2);
+                if (usable < 2) return;
+                const int16 = new Int16Array(bytes.buffer, 0, usable / 2);
+
+                // Convert Int16 PCM → Float32
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) {
+                    float32[i] = int16[i] / 32768.0;
+                }
+
+                // Create AudioBuffer and schedule
+                const buf = playbackCtx.createBuffer(1, float32.length, ttsSampleRate);
+                buf.getChannelData(0).set(float32);
+
+                const src = playbackCtx.createBufferSource();
+                src.buffer = buf;
+                src.connect(playbackCtx.destination);
+
+                const now = playbackCtx.currentTime;
+                if (nextPlayTime < now) nextPlayTime = now;
+                src.start(nextPlayTime);
+                nextPlayTime += buf.duration;
+
+                console.log('[AUDIO] scheduled:', int16.length, 'samples, plays at', nextPlayTime.toFixed(3));
+            } catch (err) {
+                console.error('[AUDIO] playPCMChunk error:', err);
+            }
+        }
+
+        function finishPlayback() {
+            if (playbackCtx) {
+                const remaining = Math.max(0, nextPlayTime - playbackCtx.currentTime);
+                console.log('[AUDIO] finishing, remaining audio:', remaining.toFixed(2), 's');
+                console.log('[AUDIO] nextPlayTime:', nextPlayTime.toFixed(3), 'currentTime:', playbackCtx.currentTime.toFixed(3));
+                // Add 500ms buffer to ensure all audio finishes
+                const bufferMs = 500;
+                setTimeout(() => {
+                    console.log('[AUDIO] playback complete, enabling recording');
+                    setStatus('جاهز للتسجيل');
+                    enableRecording();
+                }, remaining * 1000 + bufferMs);
+            } else {
+                setStatus('جاهز للتسجيل');
+                enableRecording();
+            }
+        }
+
+        function addMessage(text, role) {
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+            div.textContent = text;
+            chatLog.appendChild(div);
+            scrollToBottom();
+            return div;
+        }
+
+        function scrollToBottom() {
+            chatLog.scrollTop = chatLog.scrollHeight;
+        }
+
+        function setStatus(msg) { statusEl.textContent = msg; }
+        function disableRecording() { recordBtn.disabled = true; }
+        function enableRecording() { recordBtn.disabled = false; }
+    })();
+    </script>
+</body>
+</html>
