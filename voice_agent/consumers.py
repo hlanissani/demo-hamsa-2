@@ -401,6 +401,8 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                 if isinstance(response, bytes):
                     chunk_count += 1
                     total_bytes += len(response)
+                    if chunk_count % 10 == 0 or chunk_count <= 5:  # Log first 5, then every 10th
+                        log(f"[TTS-WS] chunk #{chunk_count}, total: {total_bytes} bytes")
                     await self.send(text_data=json.dumps({
                         "type": "tts_chunk",
                         "audio_base64": base64.b64encode(response).decode("utf-8"),
