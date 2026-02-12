@@ -52,6 +52,7 @@ TEMPLATES = [
 ROOT_URLCONF = "hamsa_ws.urls"
 
 ASGI_APPLICATION = "hamsa_ws.asgi.application"
+WSGI_APPLICATION = "hamsa_ws.wsgi.application"
 
 DATABASES = {
     "default": {
