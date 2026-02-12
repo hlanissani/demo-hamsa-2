@@ -1,0 +1,24 @@
+name: Keep Railway Services Alive
+
+on:
+  schedule:
+    # Ping every 5 minutes to prevent cold starts
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Hamsa Voice Service
+        run: |
+          echo "Pinging voice service..."
+          curl -f https://demo-hamsa-2-production.up.railway.app/ || echo "Voice service ping failed"
+
+      - name: Ping Webhook Service
+        run: |
+          echo "Pinging webhook service..."
+          curl -f https://primary-production-77c2.up.railway.app/ || echo "Webhook service ping failed"
+
+      - name: Done
+        run: echo "Keep-alive pings completed at $(date)"

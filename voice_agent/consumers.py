@@ -20,6 +20,20 @@ def log(msg):
 
 
 class VoiceAgentConsumer(AsyncWebsocketConsumer):
+    # Shared HTTP client for connection pooling (reduces latency)
+    _http_client = None
+
+    @classmethod
+    def get_http_client(cls):
+        """Get or create shared HTTP client with connection pooling."""
+        if cls._http_client is None:
+            cls._http_client = httpx.AsyncClient(
+                timeout=60.0,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+                http2=True  # Enable HTTP/2 for better performance
+            )
+        return cls._http_client
+
     async def connect(self):
         self.session_id = self.scope["url_route"]["kwargs"].get("session_id") or str(uuid.uuid4())
         await self.accept()
@@ -212,8 +226,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         log(f"[WEBHOOK] POST {settings.WEBHOOK_URL}")
         log(f"[WEBHOOK] payload: text='{text}', session_id='{self.session_id}'")
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream(
+        # Use shared HTTP client for better connection pooling
+        client = self.get_http_client()
+        async with client.stream(
                 "POST",
                 settings.WEBHOOK_URL,
                 json={"text": text, "session_id": self.session_id},
