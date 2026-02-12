@@ -208,9 +208,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         log(f"[STT] TOTAL TIME: {total_time:.2f}s")
         return transcription
 
-    # More aggressive sentence detection for streaming TTS
-    # Matches sentence-ending punctuation OR Arabic comma/pause markers
-    _SENTENCE_END_RE = re.compile(r'[.!?؟،–\-:]\s*$')
+    # Sentence detection for streaming TTS
+    # Match actual sentence endings (not every dash/colon)
+    _SENTENCE_END_RE = re.compile(r'[.!?؟،]\s*$')
 
     async def _call_webhook(self, text, sentence_q=None):
         """Call the webhook agent, stream tokens, push sentences to TTS queue."""
@@ -277,10 +277,10 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
                                 # Push sentence to TTS as soon as boundary detected
                                 stripped = sentence_buf.strip()
-                                # More aggressive streaming: push on punctuation OR length threshold
+                                # Balanced streaming: avoid tiny fragments
                                 should_stream = (
                                     len(stripped) >= 80 or  # Long enough, flush anyway
-                                    (len(stripped) >= 10 and self._SENTENCE_END_RE.search(stripped))  # Has punctuation
+                                    (len(stripped) >= 25 and self._SENTENCE_END_RE.search(stripped))  # Has punctuation + min length
                                 )
                                 if sentence_q and should_stream:
                                     log(f"[WEBHOOK] sentence ready ({len(stripped)} chars): '{stripped[:80]}'")
