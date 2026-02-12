@@ -209,8 +209,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         return transcription
 
     # Sentence detection for streaming TTS
-    # Match actual sentence endings (not every dash/colon)
-    _SENTENCE_END_RE = re.compile(r'[.!?؟،]\s*$')
+    # Match actual sentence endings only (periods, question marks, exclamation)
+    # Arabic commas (،) create pauses within sentences, not sentence breaks
+    _SENTENCE_END_RE = re.compile(r'[.!?؟]\s*$')
 
     async def _call_webhook(self, text, sentence_q=None):
         """Call the webhook agent, stream tokens, push sentences to TTS queue."""
