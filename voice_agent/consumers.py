@@ -216,6 +216,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
     async def _call_webhook(self, text, sentence_q=None):
         """Call the webhook agent, stream tokens, push sentences to TTS queue."""
+        import time
+        webhook_start = time.time()
+
         full_response = ""
         sentence_buf = ""
         sentences_pushed = False
@@ -223,22 +226,31 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         # Token batching: accumulate tokens and send in batches
         token_batch = ""
         token_count = 0
-        BATCH_SIZE = 8  # Send every 8 tokens (adjust for balance between latency/overhead)
+        last_flush_time = time.time()
+        BATCH_SIZE = 8  # Send every 8 tokens
+        FLUSH_INTERVAL_MS = 50  # Also flush every 50ms (time-based batching)
 
-        log(f"[WEBHOOK] POST {settings.WEBHOOK_URL}")
+        log(f"[WEBHOOK] >>> REQUEST START: POST {settings.WEBHOOK_URL}")
         log(f"[WEBHOOK] payload: text='{text}', session_id='{self.session_id}'")
 
         # Use shared HTTP client for better connection pooling
         client = self.get_http_client()
+        first_chunk_time = None
         async with client.stream(
                 "POST",
                 settings.WEBHOOK_URL,
                 json={"text": text, "session_id": self.session_id},
                 headers={"Accept": "application/json"},
             ) as response:
-                log(f"[WEBHOOK] HTTP {response.status_code}")
+                response_received = time.time()
+                ttfb = (response_received - webhook_start) * 1000  # Time to first byte
+                log(f"[WEBHOOK] <<< RESPONSE RECEIVED: HTTP {response.status_code} (TTFB: {ttfb:.0f}ms)")
                 buffer = ""
                 async for chunk in response.aiter_text():
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time()
+                        ttfc = (first_chunk_time - webhook_start) * 1000  # Time to first content chunk
+                        log(f"[WEBHOOK] <<< FIRST CHUNK: {ttfc:.0f}ms from request start")
                     log(f"[WEBHOOK] chunk: {chunk[:200]}")
                     buffer += chunk
                     while "\n" in buffer:
@@ -264,9 +276,13 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                                 token_batch += content
                                 token_count += 1
 
-                                # Send batch when: reaching batch size OR sentence boundary
+                                # Send batch when: reaching batch size OR time elapsed OR sentence boundary
+                                current_time = time.time()
+                                time_elapsed_ms = (current_time - last_flush_time) * 1000
+
                                 should_flush = (
                                     token_count >= BATCH_SIZE or
+                                    time_elapsed_ms >= FLUSH_INTERVAL_MS or
                                     self._SENTENCE_END_RE.search(content)
                                 )
 
@@ -276,15 +292,15 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                                     }))
                                     token_batch = ""
                                     token_count = 0
+                                    last_flush_time = current_time
 
                                 # Push sentence to TTS as soon as boundary detected
                                 stripped = sentence_buf.strip()
-                                # Balanced streaming: fast response while ensuring audible audio
-                                # All thresholds >= 30 chars (minimum for Hamsa TTS to produce audio)
+                                # Only split on complete sentence endings during streaming
+                                # Length-based splits disabled - they create short remainders with no audio
+                                # Final flush will send all remaining text regardless of length
                                 should_stream = (
-                                    len(stripped) >= 50 or  # Long enough: flush for faster response
-                                    (len(stripped) >= 40 and self._COMMA_RE.search(stripped)) or  # Comma pause (40+ reduces tiny remainders)
-                                    (len(stripped) >= 30 and self._SENTENCE_END_RE.search(stripped))  # Sentence ending (min 30 for audio)
+                                    len(stripped) >= 30 and self._SENTENCE_END_RE.search(stripped)  # Complete sentence (min 30 chars)
                                 )
                                 if sentence_q and should_stream:
                                     log(f"[WEBHOOK] sentence ready ({len(stripped)} chars): '{stripped[:80]}'")
@@ -340,6 +356,8 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         elif sentences_pushed:
             log("[WEBHOOK] ✓ STREAMING MODE - Sentences streamed to TTS in real-time")
 
+        webhook_duration = (time.time() - webhook_start) * 1000
+        log(f"[WEBHOOK] <<< COMPLETE: {webhook_duration:.0f}ms total")
         log(f"[WEBHOOK] final response: '{full_response[:200]}'")
         return full_response
 
@@ -382,6 +400,9 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
     async def _call_tts_ws(self, text):
         """Call Hamsa WebSocket TTS, stream audio chunks to client in real-time."""
+        import time
+        tts_start = time.time()
+
         ws = await self._connect_hamsa_ws()
         try:
             await ws.send(json.dumps({
@@ -394,15 +415,20 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                     "mulaw": False,
                 },
             }, ensure_ascii=False))
-            log(f"[TTS-WS] sent request: '{text[:80]}'")
+            log(f"[TTS-WS] >>> REQUEST START: '{text[:80]}' ({len(text)} chars)")
 
             chunk_count = 0
             total_bytes = 0
+            first_chunk_time = None
 
             while True:
                 response = await asyncio.wait_for(ws.recv(), timeout=30)
 
                 if isinstance(response, bytes):
+                    if first_chunk_time is None:
+                        first_chunk_time = time.time()
+                        ttfc = (first_chunk_time - tts_start) * 1000
+                        log(f"[TTS-WS] <<< FIRST AUDIO CHUNK: {ttfc:.0f}ms from request")
                     chunk_count += 1
                     total_bytes += len(response)
                     if chunk_count % 10 == 0 or chunk_count <= 5:  # Log first 5, then every 10th
@@ -420,7 +446,8 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                     if msg_type == "ack":
                         log(f"[TTS-WS] ack: {data.get('payload', {}).get('message', '')}")
                     elif msg_type == "end":
-                        log(f"[TTS-WS] done: {chunk_count} chunks, {total_bytes} bytes")
+                        tts_duration = (time.time() - tts_start) * 1000
+                        log(f"[TTS-WS] <<< COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {tts_duration:.0f}ms total")
                         break
                     elif msg_type == "error":
                         log(f"[TTS-WS] error: {data.get('payload', {}).get('message', '')}")
