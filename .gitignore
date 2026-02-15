@@ -34,3 +34,32 @@ Thumbs.db
 nul
 *.tmp
 test_*.wav
+
+# Documentation and test files (local development only)
+640-BYTE-ERROR-REPORT.md
+HAMSA-API-640-BYTE-ISSUE-REPORT.md
+HAMSA-API-ISSUES-REPORT.md
+HAMSA-WEBSOCKET-FAQ-FOR-API-TEAM.md
+ISSUES-ANALYSIS.md
+OPTIMIZATIONS-SUMMARY.md
+README-VOICE-AGENT.md
+RAG-VOICE-SETUP.md
+PERSISTENT-TTS-VERIFICATION.md
+TTS-PERSISTENT-WEBSOCKET.md
+TTS-REST-STREAMING.md
+test-cold-start.md
+check-tts-issue.md
+n8n-optimizations.md
+n8n-workflow-OPTIMIZED-FINAL.json
+
+# Test scripts (local development only)
+test_persistent_tts.py
+test_voice_latency.py
+quick_test.py
+check_logs.py
+convert_to_pdf.py
+
+# Development directories (local development only)
+docs/
+scripts/
+prompts/
