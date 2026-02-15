@@ -5,6 +5,7 @@ import logging
 import re
 import struct
 import sys
+import time
 import uuid
 
 import httpx
@@ -17,6 +18,35 @@ logger = logging.getLogger(__name__)
 
 def log(msg):
     print(msg, flush=True)
+
+
+class RequestTimer:
+    """Per-request timer to track elapsed time independently for each request."""
+    def __init__(self, name: str):
+        self.name = name
+        self.start_time = time.time()
+        self.checkpoints = {}
+
+    def checkpoint(self, label: str) -> float:
+        """Record a checkpoint and return elapsed time in ms."""
+        elapsed = (time.time() - self.start_time) * 1000
+        self.checkpoints[label] = elapsed
+        return elapsed
+
+    def elapsed_ms(self) -> float:
+        """Get total elapsed time in milliseconds."""
+        return (time.time() - self.start_time) * 1000
+
+    def log_checkpoint(self, label: str):
+        """Log a checkpoint with elapsed time."""
+        elapsed = self.checkpoint(label)
+        log(f"[{self.name}] {label}: {elapsed:.0f}ms")
+
+    def log_complete(self):
+        """Log completion with total time."""
+        total = self.elapsed_ms()
+        log(f"[{self.name}] <<< COMPLETE: {total:.0f}ms total")
+        return total
 
 
 class VoiceAgentConsumer(AsyncWebsocketConsumer):
@@ -36,11 +66,19 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
     async def connect(self):
         self.session_id = self.scope["url_route"]["kwargs"].get("session_id") or str(uuid.uuid4())
+        self.tts_ws = None  # Persistent TTS WebSocket connection
         await self.accept()
         await self._send_status("متصل بالخادم")
 
     async def disconnect(self, close_code):
-        pass
+        # Clean up persistent TTS connection
+        if self.tts_ws:
+            try:
+                await self.tts_ws.close()
+                log("[DISCONNECT] Closed persistent TTS WebSocket")
+            except:
+                pass
+        log(f"[DISCONNECT] Session {self.session_id} disconnected")
 
     async def receive(self, text_data=None, bytes_data=None):
         if text_data is None:
@@ -69,6 +107,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
             if not transcription:
                 await self._send_error("لم يتم التعرف على أي نص")
                 return
+
             await self.send(text_data=json.dumps({
                 "type": "transcription", "text": transcription
             }))
@@ -83,16 +122,21 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
             agent_response = await self._call_webhook(transcription, sentence_q)
             log(f"[PIPELINE] Webhook result: '{agent_response}' (len={len(agent_response) if agent_response else 0})")
 
-            # Signal TTS consumer to finish and wait
-            await sentence_q.put(None)
-            await tts_task
-
             if not agent_response:
                 await self._send_error("لم يتم الحصول على رد من الوكيل")
+                # Signal TTS consumer to stop
+                await sentence_q.put(None)
+                await tts_task
                 return
+
+            # Send agent_response immediately after webhook (for accurate timing measurement)
             await self.send(text_data=json.dumps({
                 "type": "agent_response", "text": agent_response
             }))
+
+            # Signal TTS consumer to finish and wait
+            await sentence_q.put(None)
+            await tts_task
 
             # Small delay to ensure all TTS chunks are transmitted over WebSocket
             await asyncio.sleep(0.5)
@@ -105,7 +149,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
             await self._send_error(str(e))
 
     async def _tts_consumer(self, sentence_q):
-        """Read sentences from queue, TTS each via WebSocket, stream chunks to client."""
+        """Read sentences from queue, TTS each via REST streaming, stream chunks to client."""
         idx = 0
         while True:
             sentence = await sentence_q.get()
@@ -120,6 +164,8 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
             log(f"[TTS-STREAM] sentence {idx}: '{sentence[:80]}'")
             await self._send_status("جاري تحويل الرد إلى صوت...")
             try:
+                # Use persistent WebSocket connection (recommended by Hamsa API docs)
+                # Alternative: await self._call_tts_stream(sentence)  # REST streaming API
                 await self._call_tts_ws(sentence)
             except Exception as e:
                 log(f"[TTS-STREAM] ERROR on sentence {idx}: {type(e).__name__}: {e}")
@@ -129,33 +175,36 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         url = f"{settings.HAMSA_WS_URL}?api_key={settings.HAMSA_API_KEY}"
         for attempt in range(3):
             try:
-                ws = await websockets.connect(url)
-                init_msg = await ws.recv()
+                ws = await asyncio.wait_for(
+                    websockets.connect(url, ping_interval=20, ping_timeout=10),
+                    timeout=5.0  # 5 second connection timeout
+                )
+                init_msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
                 log(f"[HAMSA] connected (attempt {attempt + 1}): {init_msg}")
                 return ws
             except Exception as e:
                 log(f"[HAMSA] connection attempt {attempt + 1} failed: {type(e).__name__}: {e}")
                 if attempt < 2:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)  # Faster retry
                 else:
                     raise
 
     async def _call_stt(self, audio_base64):
         """Connect to Hamsa STT WebSocket, send audio, return transcription."""
-        import time
-        start_time = time.time()
+        timer = RequestTimer("STT")
 
-        log(f"[STT] connecting... (audio size: {len(audio_base64)} chars)")
+        log(f"[STT] >>> REQUEST START (audio size: {len(audio_base64)} chars)")
         await self._send_status("جاري الاتصال بخدمة التعرف...")
 
         transcription = None
 
+        connect_start = timer.elapsed_ms()
         ws = await self._connect_hamsa_ws()
-        connect_time = time.time() - start_time
-        log(f"[STT] connected in {connect_time:.2f}s")
+        timer.log_checkpoint("Connected")
+        log(f"[STT] Connection took: {timer.elapsed_ms() - connect_start:.0f}ms")
 
         try:
-            send_start = time.time()
+            send_start = timer.elapsed_ms()
             await ws.send(json.dumps({
                 "type": "stt",
                 "payload": {
@@ -165,10 +214,11 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                     "eosThreshold": 0.3,
                 },
             }, ensure_ascii=False))
-            send_time = time.time() - send_start
-            log(f"[STT] sent audio in {send_time:.2f}s, waiting for response...")
+            timer.log_checkpoint("Audio sent")
+            log(f"[STT] Send took: {timer.elapsed_ms() - send_start:.0f}ms")
             await self._send_status("جاري معالجة الصوت...")
 
+            recv_start = timer.elapsed_ms()
             while True:
                 response = await asyncio.wait_for(ws.recv(), timeout=30)
                 log(f"[STT] response type={type(response).__name__} len={len(response) if response else 0}")
@@ -191,6 +241,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                     elif msg_type == "transcription":
                         transcription = data.get("payload", {}).get("text", "")
                         log(f"[STT] transcription from JSON: {transcription}")
+                        log(f"[STT] Processing took: {timer.elapsed_ms() - recv_start:.0f}ms")
                         break
                     else:
                         log(f"[STT] unknown JSON: {data}")
@@ -204,8 +255,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         finally:
             await ws.close()
 
-        total_time = time.time() - start_time
-        log(f"[STT] TOTAL TIME: {total_time:.2f}s")
+        timer.log_complete()
         return transcription
 
     # Sentence detection for streaming TTS
@@ -216,8 +266,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
     async def _call_webhook(self, text, sentence_q=None):
         """Call the webhook agent, stream tokens, push sentences to TTS queue."""
-        import time
-        webhook_start = time.time()
+        timer = RequestTimer("WEBHOOK")
 
         full_response = ""
         sentence_buf = ""
@@ -227,30 +276,33 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         token_batch = ""
         token_count = 0
         last_flush_time = time.time()
-        BATCH_SIZE = 8  # Send every 8 tokens
-        FLUSH_INTERVAL_MS = 50  # Also flush every 50ms (time-based batching)
+        BATCH_SIZE = 12  # Send every 12 tokens (matches n8n batching)
+        FLUSH_INTERVAL_MS = 40  # Also flush every 40ms (time-based batching for low latency)
 
         log(f"[WEBHOOK] >>> REQUEST START: POST {settings.WEBHOOK_URL}")
         log(f"[WEBHOOK] payload: text='{text}', session_id='{self.session_id}'")
 
         # Use shared HTTP client for better connection pooling
         client = self.get_http_client()
-        first_chunk_time = None
+        first_chunk_received = False
         async with client.stream(
                 "POST",
                 settings.WEBHOOK_URL,
                 json={"text": text, "session_id": self.session_id},
                 headers={"Accept": "application/json"},
             ) as response:
-                response_received = time.time()
-                ttfb = (response_received - webhook_start) * 1000  # Time to first byte
+                ttfb = timer.checkpoint("TTFB")
                 log(f"[WEBHOOK] <<< RESPONSE RECEIVED: HTTP {response.status_code} (TTFB: {ttfb:.0f}ms)")
+
+                # Log n8n processing time when available
+                n8n_processing_time = response.headers.get("X-N8n-Processing-Time")
+                if n8n_processing_time:
+                    log(f"[WEBHOOK] n8n processing time: {n8n_processing_time}ms")
                 buffer = ""
                 async for chunk in response.aiter_text():
-                    if first_chunk_time is None:
-                        first_chunk_time = time.time()
-                        ttfc = (first_chunk_time - webhook_start) * 1000  # Time to first content chunk
-                        log(f"[WEBHOOK] <<< FIRST CHUNK: {ttfc:.0f}ms from request start")
+                    if not first_chunk_received:
+                        timer.log_checkpoint("First content chunk")
+                        first_chunk_received = True
                     log(f"[WEBHOOK] chunk: {chunk[:200]}")
                     buffer += chunk
                     while "\n" in buffer:
@@ -266,11 +318,15 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
                         node_name = data.get("metadata", {}).get("nodeName", "")
                         msg_type = data.get("type", "")
-                        log(f"[WEBHOOK] node='{node_name}' type='{msg_type}'")
 
-                        if node_name == "Conversation Agent" and msg_type == "item":
+                        # Skip logging empty chunks to reduce noise
+                        content_preview = data.get("content", "")
+                        if content_preview or msg_type in ["begin", "end"]:
+                            log(f"[WEBHOOK] node='{node_name}' type='{msg_type}' content='{content_preview[:50]}'")
+
+                        if node_name == "Voice Agent" and msg_type == "item":
                             content = data.get("content", "")
-                            if content:
+                            if content:  # Skip empty content chunks
                                 full_response += content
                                 sentence_buf += content
                                 token_batch += content
@@ -300,7 +356,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                                 # Length-based splits disabled - they create short remainders with no audio
                                 # Final flush will send all remaining text regardless of length
                                 should_stream = (
-                                    len(stripped) >= 30 and self._SENTENCE_END_RE.search(stripped)  # Complete sentence (min 30 chars)
+                                    len(stripped) >= 50 and self._SENTENCE_END_RE.search(stripped)  # Complete sentence (min 50 chars to avoid rapid-fire TTS requests and rate limiting)
                                 )
                                 if sentence_q and should_stream:
                                     log(f"[WEBHOOK] sentence ready ({len(stripped)} chars): '{stripped[:80]}'")
@@ -356,8 +412,7 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         elif sentences_pushed:
             log("[WEBHOOK] ✓ STREAMING MODE - Sentences streamed to TTS in real-time")
 
-        webhook_duration = (time.time() - webhook_start) * 1000
-        log(f"[WEBHOOK] <<< COMPLETE: {webhook_duration:.0f}ms total")
+        timer.log_complete()
         log(f"[WEBHOOK] final response: '{full_response[:200]}'")
         return full_response
 
@@ -398,18 +453,62 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         )
         return header + pcm_data
 
-    async def _call_tts_ws(self, text):
-        """Call Hamsa WebSocket TTS, stream audio chunks to client in real-time."""
-        import time
-        tts_start = time.time()
+    async def _get_or_create_tts_ws(self):
+        """Get existing TTS WebSocket or create new one."""
+        # Check if we need a new connection
+        if self.tts_ws is None:
+            log("[TTS-WS] Creating new persistent connection")
+            self.tts_ws = await self._connect_hamsa_ws()
+        else:
+            # Check if existing connection is still alive
+            try:
+                # For websockets library, check the state
+                from websockets.protocol import State
+                if self.tts_ws.state != State.OPEN:
+                    log("[TTS-WS] Previous connection closed, creating new one")
+                    self.tts_ws = await self._connect_hamsa_ws()
+                else:
+                    log("[TTS-WS] Reusing existing connection ✓")
+            except Exception as e:
+                log(f"[TTS-WS] Connection check failed ({type(e).__name__}: {e}), creating new one")
+                self.tts_ws = await self._connect_hamsa_ws()
+        return self.tts_ws
 
-        ws = await self._connect_hamsa_ws()
+    async def _call_tts_ws(self, text):
+        """Call Hamsa WebSocket TTS using persistent connection, stream audio chunks to client in real-time."""
+        # Retry logic for 640-byte failures (API rate limiting)
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            total_bytes = await self._do_tts_request(text, attempt)
+
+            # Check if we got complete audio (>10KB typically means success)
+            if total_bytes > 10000:
+                return  # Success!
+
+            # Incomplete audio (640 bytes), retry if we have attempts left
+            if attempt < max_retries:
+                delay = 2 ** attempt  # Exponential backoff: 1s, 2s
+                log(f"[TTS-WS] ⚠️  Incomplete audio ({total_bytes} bytes), retrying in {delay}s... (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(delay)
+                # Force reconnection on retry
+                self.tts_ws = None
+            else:
+                log(f"[TTS-WS] ❌ Failed after {max_retries + 1} attempts, got {total_bytes} bytes")
+                # Still failed, but we sent what we got
+
+    async def _do_tts_request(self, text, attempt_num=0):
+        """Perform single TTS request, return total bytes received."""
+        timer = RequestTimer(f"TTS-WS-{id(self)}")  # Unique ID per request
+
+        # Get or reuse persistent connection
+        ws = await self._get_or_create_tts_ws()
+
         try:
             await ws.send(json.dumps({
                 "type": "tts",
                 "payload": {
                     "text": text,
-                    "speaker": "Majd",
+                    "speaker": "Tamer",
                     "dialect": "ksa",
                     "languageId": "ar",
                     "mulaw": False,
@@ -419,16 +518,27 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
 
             chunk_count = 0
             total_bytes = 0
-            first_chunk_time = None
+            first_chunk_received = False
+            end_received = False
 
             while True:
-                response = await asyncio.wait_for(ws.recv(), timeout=30)
+                try:
+                    # Use shorter timeout after receiving 'end' signal
+                    timeout = 2.0 if end_received else 30.0
+                    response = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    if end_received:
+                        # Normal - we got end message and timed out waiting for more
+                        log("[TTS-WS] No more chunks after end signal, completing")
+                        break
+                    else:
+                        # Unexpected timeout
+                        raise
 
                 if isinstance(response, bytes):
-                    if first_chunk_time is None:
-                        first_chunk_time = time.time()
-                        ttfc = (first_chunk_time - tts_start) * 1000
-                        log(f"[TTS-WS] <<< FIRST AUDIO CHUNK: {ttfc:.0f}ms from request")
+                    if not first_chunk_received:
+                        timer.log_checkpoint("First audio chunk")
+                        first_chunk_received = True
                     chunk_count += 1
                     total_bytes += len(response)
                     if chunk_count % 10 == 0 or chunk_count <= 5:  # Log first 5, then every 10th
@@ -446,9 +556,10 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                     if msg_type == "ack":
                         log(f"[TTS-WS] ack: {data.get('payload', {}).get('message', '')}")
                     elif msg_type == "end":
-                        tts_duration = (time.time() - tts_start) * 1000
-                        log(f"[TTS-WS] <<< COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {tts_duration:.0f}ms total")
-                        break
+                        log(f"[TTS-WS] end signal received, waiting for remaining chunks...")
+                        end_received = True
+                        # Don't break immediately - wait for any remaining audio chunks
+                        # Will timeout after 30s if no more chunks come
                     elif msg_type == "error":
                         log(f"[TTS-WS] error: {data.get('payload', {}).get('message', '')}")
                         break
@@ -456,13 +567,24 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
                         log(f"[TTS-WS] msg: {data}")
                 except json.JSONDecodeError:
                     log(f"[TTS-WS] non-JSON: {response[:200]}")
-        except asyncio.TimeoutError:
-            log("[TTS-WS] timeout")
-        finally:
-            await ws.close()
 
-    async def _call_tts(self, text):
-        """Call Hamsa REST TTS API, return audio bytes."""
+            total_time = timer.elapsed_ms()
+            log(f"[TTS-WS] <<< COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {total_time:.0f}ms total")
+            return total_bytes
+        except asyncio.TimeoutError:
+            log("[TTS-WS] timeout - marking connection for reconnection")
+            self.tts_ws = None  # Mark for reconnection
+            return 0
+        except Exception as e:
+            log(f"[TTS-WS] error: {type(e).__name__}: {e} - marking connection for reconnection")
+            self.tts_ws = None  # Mark for reconnection
+            return 0
+        # Don't close connection - reuse it for next request!
+
+    async def _call_tts_stream(self, text):
+        """Call Hamsa REST Streaming TTS API, stream audio chunks to client in real-time."""
+        timer = RequestTimer(f"TTS-STREAM-{id(self)}")
+
         url = "https://api.tryhamsa.com/v1/realtime/tts-stream"
         headers = {
             "Authorization": f"Token {settings.HAMSA_API_KEY}",
@@ -470,40 +592,56 @@ class VoiceAgentConsumer(AsyncWebsocketConsumer):
         }
         body = {
             "text": text,
-            "speaker": "Majd",
+            "speaker": "Tamer",
             "dialect": "ksa",
             "mulaw": False,
         }
 
-        log(f"[TTS] POST {url} text='{text[:80]}'")
-        audio_chunks = []
+        log(f"[TTS-STREAM] >>> REQUEST START: '{text[:80]}' ({len(text)} chars)")
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        chunk_count = 0
+        total_bytes = 0
+        first_chunk_received = False
+
+        try:
+            # Use shared HTTP client for better connection pooling
+            client = self.get_http_client()
             async with client.stream("POST", url, json=body, headers=headers) as response:
-                log(f"[TTS] HTTP {response.status_code}")
-                content_type = response.headers.get("content-type", "")
-                log(f"[TTS] Content-Type: {content_type}")
+                log(f"[TTS-STREAM] <<< RESPONSE: HTTP {response.status_code}")
+
                 if response.status_code != 200:
-                    log(f"[TTS] ERROR: HTTP {response.status_code}")
-                    return None
-                async for chunk in response.aiter_bytes():
-                    audio_chunks.append(chunk)
+                    error_text = await response.aread()
+                    log(f"[TTS-STREAM] ERROR: HTTP {response.status_code} - {error_text[:200]}")
+                    return 0
 
-        total = sum(len(c) for c in audio_chunks)
-        log(f"[TTS] total audio: {total} bytes from {len(audio_chunks)} chunks")
-        if not audio_chunks:
-            return None
+                # Stream audio chunks to client as they arrive
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    if not chunk:
+                        continue
 
-        audio_data = b"".join(audio_chunks)
+                    if not first_chunk_received:
+                        timer.log_checkpoint("First audio chunk")
+                        first_chunk_received = True
 
-        # If the data already has a WAV header, return as-is
-        if audio_data[:4] == b"RIFF":
-            log("[TTS] audio already has WAV header")
-            return audio_data
+                    chunk_count += 1
+                    total_bytes += len(chunk)
 
-        # Raw PCM — wrap in WAV header so the browser can play it
-        log("[TTS] wrapping raw PCM in WAV header")
-        return self._wrap_wav(audio_data)
+                    if chunk_count % 10 == 0 or chunk_count <= 5:
+                        log(f"[TTS-STREAM] chunk #{chunk_count}, total: {total_bytes} bytes")
+
+                    # Send audio chunk to client immediately
+                    await self.send(text_data=json.dumps({
+                        "type": "tts_chunk",
+                        "audio_base64": base64.b64encode(chunk).decode("utf-8"),
+                    }))
+
+            total_time = timer.elapsed_ms()
+            log(f"[TTS-STREAM] <<< COMPLETE: {chunk_count} chunks, {total_bytes} bytes, {total_time:.0f}ms total")
+            return total_bytes
+
+        except Exception as e:
+            log(f"[TTS-STREAM] error: {type(e).__name__}: {e}")
+            return 0
 
     async def _send_status(self, message):
         await self.send(text_data=json.dumps({"type": "status", "message": message}))
